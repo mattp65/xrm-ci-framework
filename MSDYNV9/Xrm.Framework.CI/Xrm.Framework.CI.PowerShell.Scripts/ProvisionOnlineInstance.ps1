@@ -22,7 +22,8 @@ param(
 [string]$SecurityGroupName,
 [bool]$WaitForCompletion = $false,
 [int]$SleepDuration = 3,
-[string]$PSModulePath
+[string]$PSModulePath,
+[string]$AzureADModulePath
 )
 
 $ErrorActionPreference = "Stop"
@@ -49,10 +50,14 @@ Write-Verbose "SecurityGroupName = $SecurityGroupName"
 Write-Verbose "WaitForCompletion = $WaitForCompletion"
 Write-Verbose "SleepDuration = $SleepDuration"
 Write-Verbose "PSModulePath = $PSModulePath"
+Write-Verbose "AzureADModulePath = $AzureADModulePath"
 
 #Script Location
 $scriptPath = split-path -parent $MyInvocation.MyCommand.Definition
 Write-Verbose "Script Path: $scriptPath"
+
+#Set Security Protocol
+& "$scriptPath\SetTlsVersion.ps1"
 
 #Load Online Management Module
 $xrmOnlineModule = $scriptPath + "\Microsoft.Xrm.OnlineManagementAPI.dll"
@@ -100,25 +105,35 @@ if ($CurrencySymbol -ne '')
 	$InstanceInfoParams.CurrencySymbol = $CurrencySymbol
 }
 
-if ($SecurityGroupName -ne '')
+if ($SecurityGroupName)
 {
-	Write-Verbose "Importing Module AzureAD" 
-	Import-Module AzureAD
-	Write-Verbose "Imported Module AzureAD" 
-	
-	$group = Get-AzureADGroup -Filter "DisplayName eq '$SecurityGroupName'"
+	if ($AzureADModulePath)
+    {
+        Write-Verbose "Importing Module AzureAD" 
+	    Import-Module "$AzureADModulePath\AzureAD.psd1"
+	    Write-Verbose "Imported Module AzureAD"
 
-	if ($group -ne $null)
-	{
-		$SecurityGroupId = $group.ObjectId
-	}
-	if ($group -eq $null)
-	{
-		throw "$SecurityGroupName not found"
-	}
+        Connect-AzureAD -Credential $Cred
+	
+	    $group = Get-AzureADGroup -Filter "DisplayName eq '$SecurityGroupName'"
+
+	    if ($group)
+	    {
+		    Write-Host "Security Group Found with Id $($group.ObjectId)"
+            $SecurityGroupId = $group.ObjectId
+	    }
+	    else
+	    {
+		    throw "$SecurityGroupName not found"
+	    }
+    }
+    else
+    {
+        throw "AzureADModulePath is required"
+    }
 }
 
-if ($SecurityGroupId -ne '')
+if ($SecurityGroupId)
 {
 	$InstanceInfoParams.SecurityGroupId = $SecurityGroupId
 }
@@ -139,8 +154,10 @@ if ($operation.Errors.Count -gt 0)
     throw "Errors encountered : $errorMessage"
 }
 
-if ($WaitForCompletion -and ($OperationStatus -ne "Succeeded"))
+if ($WaitForCompletion -and ($operation.OperationId -ne [system.guid]::empty)  -and ($OperationStatus -ne "Succeeded"))
 {
+	Write-Verbose "Waiting for AsyncOperation to complete"
+
 	$status = Wait-XrmOperation -ApiUrl $ApiUrl -Cred $Cred -operationId $operation.OperationId
 
 	$status
@@ -150,26 +167,48 @@ if ($WaitForCompletion -and ($OperationStatus -ne "Succeeded"))
 		throw "Operation status: $status.Status"
 	}
 }
-
-if ($WaitForCompletion)
+else
 {
+	Write-Verbose "Skipped waiting for Async Operation"
+}
+
+#Removed code below as sometimes instances get created with numbers appended to name like [instancename]0
+if ($WaitForCompletion -and $false)
+{	
 	#Sometimes instance is created but the API still returns NOT FOUND (no other instances available).
 	#Added this delay to give chance for operation to progress.
+
+	Write-Host "Starting Initial Sleep for 30 seconds"
+
 	Start-Sleep -Seconds 30
+
+	Write-Host "Attempting to poll for instance every $SleepDuration secs"
 	
 	$provisioning = $true
 	while ($provisioning)
 	{
+		Write-Verbose "Starting Sleep for $SleepDuration seconds"
+		
 		Start-Sleep -Seconds $SleepDuration
 
+		Write-Verbose "Retrieving instance"
+
 		$instance = Get-XrmInstanceByName -ApiUrl $ApiUrl -Cred $Cred -InstanceName $DomainName
-		$State = $instance.State
 
-		Write-Verbose "Instance State: $State"
-
-		if (($instance -ne $null) -and ($State -eq "Ready"))
+		if ($instance)
 		{
-			$provisioning = $false
+			$State = $instance.State
+			
+			Write-Host "Instance State: $State"
+
+			if ($State -eq "Ready")
+			{
+				$provisioning = $false
+			}
+		}
+		else
+		{
+			Write-Host "$DomainName not found"
 		}
 	}
 }

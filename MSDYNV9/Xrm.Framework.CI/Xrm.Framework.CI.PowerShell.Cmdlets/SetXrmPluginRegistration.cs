@@ -1,13 +1,9 @@
 ﻿using Newtonsoft.Json;
 using System;
-using System.Collections.Generic;
-using System.Diagnostics;
 using System.IO;
-using System.Linq;
 using System.Management.Automation;
-using System.Text;
-using System.Threading.Tasks;
-using Xrm.Framework.CI.PowerShell.Cmdlets.Common;
+using Xrm.Framework.CI.Common;
+using Xrm.Framework.CI.Common.Entities;
 
 namespace Xrm.Framework.CI.PowerShell.Cmdlets
 {
@@ -26,22 +22,25 @@ namespace Xrm.Framework.CI.PowerShell.Cmdlets
         #region Parameters
 
         [Parameter(Mandatory = true)]
-        public String RegistrationType { get; set; }
+        public RegistrationTypeEnum RegistrationType { get; set; }
 
         /// <summary>
         /// <para type="description">The full path to the assembly. e.g. C:\Solution\bin\release\Plugin.dll</para>
         /// </summary>
         [Parameter(Mandatory = true)]
-        public String AssemblyPath { get; set; }
-
-        [Parameter(Mandatory = true)]
-        public Boolean IsWorkflowActivityAssembly { get; set; }
+        public string AssemblyPath { get; set; }
 
         [Parameter(Mandatory = false)]
-        public String MappingJsonPath { get; set; }
+        public bool UseSplitAssembly { get; set; }
 
         [Parameter(Mandatory = false)]
-        public String SolutionName { get; set; }
+        public string ProjectFilePath { get; set; }
+
+        [Parameter(Mandatory = false)]
+        public string MappingFile { get; set; }
+
+        [Parameter(Mandatory = false)]
+        public string SolutionName { get; set; }
         #endregion
 
         #region Process Record
@@ -50,65 +49,90 @@ namespace Xrm.Framework.CI.PowerShell.Cmdlets
         {
             base.ProcessRecord();
 
-            base.WriteVerbose("Plugin Registration intiated");
+            WriteVerbose("Plugin Registration intiated");
 
-            FileInfo assemblyInfo = new FileInfo(AssemblyPath);
-            var lastIndex = assemblyInfo.Name.LastIndexOf(".dll");
-            string assemblyName = lastIndex > 0 ? assemblyInfo.Name.Remove(lastIndex, 4) : assemblyInfo.Name;
-            string version = FileVersionInfo.GetVersionInfo(AssemblyPath).FileVersion;
-            string content = Convert.ToBase64String(File.ReadAllBytes(AssemblyPath));
+            if (UseSplitAssembly)
+            {
+                if (!File.Exists(ProjectFilePath)) throw new Exception("Project File Path is required if you want to split assembly.");
+                if (RegistrationType == RegistrationTypeEnum.Delsert) throw new Exception("Registration type 'Remove Plugin Types and Steps which are not in mapping and Upsert' will not work when 'Split Assembly' is enabled.");
+                if (!File.Exists(MappingFile)) throw new Exception("Mapping Json Path is required if you want to split assembly.");
+            }
 
-            base.WriteVerbose(string.Format("Assembly Name: {0}", assemblyName));
-            base.WriteVerbose(string.Format("Assembly Version: {0}", version));
+            var assemblyInfo = AssemblyInfo.GetAssemblyInfo(AssemblyPath);
+            WriteVerbose($"Assembly Name: {assemblyInfo.AssemblyName}");
+            WriteVerbose($"Assembly Version: {assemblyInfo.Version}");
 
             using (var context = new CIContext(OrganizationService))
             {
-                PluginRegistrationHelper pluginRegistrationHelper = new PluginRegistrationHelper(OrganizationService, context);
-                base.WriteVerbose("PluginRegistrationHelper intiated");
+                var pluginRegistrationHelper = new PluginRegistrationHelper(OrganizationService, context, WriteVerbose, WriteWarning);
+                WriteVerbose("PluginRegistrationHelper intiated");
                 Assembly pluginAssembly = null;
-                if (File.Exists(MappingJsonPath))
+                Guid pluginAssemblyId = Guid.Empty;
+
+                if (File.Exists(MappingFile))
                 {
-                    base.WriteVerbose("Reading mapping json file");
-                    string json = File.ReadAllText(MappingJsonPath);
-                    pluginAssembly = JsonConvert.DeserializeObject<Assembly>(json);
-                    base.WriteVerbose("Deserialized mapping json file");
+                    pluginAssembly = pluginRegistrationHelper.ReadMappingFile(MappingFile);
+                    pluginAssemblyId = pluginAssembly.Id ?? Guid.Empty;
+                }
+                else
+                {
+                    pluginAssemblyId = pluginRegistrationHelper.UpsertPluginAssembly(pluginAssembly, assemblyInfo, SolutionName, RegistrationType);
+                    WriteVerbose($"UpsertPluginAssembly {pluginAssemblyId} completed");
+                    WriteVerbose("Plugin Registration completed");
+                    return;
                 }
 
-                var pluginAssemblyId = pluginRegistrationHelper.UpsertPluginAssembly(pluginAssembly, assemblyName, version, content, SolutionName, IsWorkflowActivityAssembly, RegistrationType);
-                base.WriteVerbose(string.Format("UpsertPluginAssembly {0} completed", pluginAssemblyId));
-
-                if (pluginAssembly != null)
+                if (pluginAssembly == null)
                 {
-                    // var assemblyTypes = IsWorkflowActivityAssembly ? pluginAssembly.WorkflowTypes : pluginAssembly.PluginTypes;
-                    if (pluginAssembly.PluginTypes == null)
+                    WriteVerbose("Plugin Registration completed");
+                    return;
+                }
+
+                if (pluginAssembly.PluginTypes == null)
+                {
+                    WriteVerbose("No mapping found for types.");
+                    WriteVerbose("Plugin Registration completed");
+                    return;
+                }
+
+                if (RegistrationType == RegistrationTypeEnum.Delsert)
+                {
+                    WriteVerbose($"RemoveComponentsNotInMapping {assemblyInfo.AssemblyName} started");
+                    pluginRegistrationHelper.RemoveComponentsNotInMapping(pluginAssembly);
+                    WriteVerbose($"RemoveComponentsNotInMapping {assemblyInfo.AssemblyName} completed");
+                    RegistrationType = RegistrationTypeEnum.Upsert;
+                }
+
+                if (UseSplitAssembly)
+                {
+                    foreach (var type in pluginAssembly.PluginTypes)
                     {
-                        base.WriteVerbose("No mapping found for types.");
+                        UploadSplitAssembly(assemblyInfo, pluginRegistrationHelper, type);
                     }
-                    else
+                }
+                else
+                {
+                    WriteVerbose($"UpsertPluginAssembly {pluginAssemblyId} started");
+                    pluginAssemblyId = pluginRegistrationHelper.UpsertPluginAssembly(pluginAssembly, assemblyInfo, SolutionName, RegistrationType);
+                    WriteVerbose($"UpsertPluginAssembly {pluginAssemblyId} completed");
+
+                    foreach (var type in pluginAssembly.PluginTypes)
                     {
-                        foreach (var type in pluginAssembly.PluginTypes)
-                        {
-                            var pluginTypeId = pluginRegistrationHelper.UpsertPluginType(pluginAssemblyId, type, SolutionName, RegistrationType, IsWorkflowActivityAssembly, assemblyName);
-                            base.WriteVerbose(string.Format("UpsertPluginType {0} completed", pluginTypeId));
-                            if (!IsWorkflowActivityAssembly)
-                            {
-                                foreach (var step in type.Steps)
-                                {
-                                    var sdkMessageProcessingStepId = pluginRegistrationHelper.UpsertSdkMessageProcessingStep(pluginTypeId, step, SolutionName, RegistrationType);
-                                    base.WriteVerbose(string.Format("UpsertSdkMessageProcessingStep {0} completed", sdkMessageProcessingStepId));
-                                    foreach (var image in step.Images)
-                                    {
-                                        var sdkMessageProcessingStepImageId = pluginRegistrationHelper.UpsertSdkMessageProcessingStepImage(sdkMessageProcessingStepId, image, SolutionName, RegistrationType);
-                                        base.WriteVerbose(string.Format("UpsertSdkMessageProcessingStepImage {0} completed", sdkMessageProcessingStepImageId));
-                                    }
-                                }
-                            }
-                        }
+                        pluginRegistrationHelper.UpsertPluginTypeAndSteps(pluginAssemblyId, type, SolutionName, RegistrationType);
                     }
                 }
             }
+            WriteVerbose("Plugin Registration completed");
+        }
 
-            base.WriteVerbose("Plugin Registration completed");
+       private void UploadSplitAssembly(AssemblyInfo assemblyInfo, PluginRegistrationHelper pluginRegistrationHelper, Xrm.Framework.CI.Common.Type type)
+        {
+            var temp = new FileInfo(ProjectFilePath);
+            var splitAssembly = AssemblyInfo.GetAssemblyInfo(assemblyInfo.AssemblyDirectory.Replace(temp.DirectoryName, temp.DirectoryName + type.Name) + "\\" + type.Name + ".dll");
+            var pluginAssemblyId = pluginRegistrationHelper.UpsertPluginAssembly(null, splitAssembly, SolutionName, RegistrationType);
+            WriteVerbose($"UpsertPluginAssembly {pluginAssemblyId} completed");
+
+            pluginRegistrationHelper.UpsertPluginTypeAndSteps(pluginAssemblyId, type, SolutionName, RegistrationType);
         }
 
         #endregion

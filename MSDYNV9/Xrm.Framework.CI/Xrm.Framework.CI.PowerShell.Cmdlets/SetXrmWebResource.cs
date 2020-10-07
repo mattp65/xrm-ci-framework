@@ -1,13 +1,11 @@
 ﻿using Microsoft.Crm.Sdk.Messages;
 using System;
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Management.Automation;
-using System.Text;
 using System.Text.RegularExpressions;
-using System.Threading.Tasks;
+using Xrm.Framework.CI.Common.Entities;
 using Xrm.Framework.CI.PowerShell.Cmdlets.Common;
 
 namespace Xrm.Framework.CI.PowerShell.Cmdlets
@@ -47,6 +45,9 @@ namespace Xrm.Framework.CI.PowerShell.Cmdlets
         [Parameter(Mandatory = false)]
         public String RegExToMatchUniqueName { get; set; }
 
+        [Parameter(Mandatory = false)]
+        public Guid SolutionId { get; set; }
+
         #endregion
 
         #region Process Record
@@ -56,7 +57,7 @@ namespace Xrm.Framework.CI.PowerShell.Cmdlets
             base.ProcessRecord();
 
             base.WriteVerbose(string.Format("Updating Web Resource: {0}", Path));
-
+            base.WriteVerbose(string.Format("Solution Id: {0}", SolutionId));
             FileInfo webResourceInfo = new FileInfo(Path);
 
             String content = Convert.ToBase64String(File.ReadAllBytes(Path));
@@ -68,12 +69,24 @@ namespace Xrm.Framework.CI.PowerShell.Cmdlets
                 if (String.IsNullOrEmpty(UniqueName))
                 {
                     var query = from a in context.WebResourceSet
-                                where a.Name.Contains(System.IO.Path.GetFileNameWithoutExtension(webResourceInfo.Name))
+                                where a.Name == System.IO.Path.GetFileNameWithoutExtension(webResourceInfo.Name)
                                 select new WebResource
                                 {
                                     Name = a.Name,
                                     Id = a.Id
                                 };
+
+                    if (!SolutionId.Equals(Guid.Empty))
+                    {
+                        query = from a in context.WebResourceSet
+                                join sol in context.SolutionComponentSet on a.Id equals sol.ObjectId
+                                where a.Name.Contains(System.IO.Path.GetFileNameWithoutExtension(webResourceInfo.Name)) && sol.SolutionId.Equals(SolutionId)
+                                select new WebResource
+                                {
+                                    Name = a.Name,
+                                    Id = a.Id
+                                };
+                    }
 
                     List<WebResource> resources = new List<WebResource>();
 
@@ -82,15 +95,15 @@ namespace Xrm.Framework.CI.PowerShell.Cmdlets
                         base.WriteVerbose(string.Format("Searching Web Resource with RegEx: {0}", RegExToMatchUniqueName));
                         Regex rgx = new Regex(RegExToMatchUniqueName, RegexOptions.IgnoreCase);
                         resources = (from a in query.ToList()
-                                    where rgx.IsMatch(a.Name)
-                                    select new WebResource
-                                    {
-                                        Name = a.Name,
-                                        Id = a.Id
-                                    }).ToList();
+                                     where rgx.IsMatch(a.Name)
+                                     select new WebResource
+                                     {
+                                         Name = a.Name,
+                                         Id = a.Id
+                                     }).ToList();
                     }
                     else
-                    {                        
+                    {
                         resources = query.ToList();
                     }
 

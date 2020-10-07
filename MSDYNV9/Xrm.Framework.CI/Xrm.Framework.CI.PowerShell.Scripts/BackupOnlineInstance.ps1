@@ -9,13 +9,11 @@ param(
 [string]$InstanceName,
 [string]$BackupLabel,
 [string]$BackupNotes,
-[bool]$IsAzureBackup = $false,
-[string]$ContainerName,
-[string]$StorageAccountKey,
-[string]$StorageAccountName,
+[int]$MaxCrmConnectionTimeOutMinutes,
 [bool]$WaitForCompletion = $false,
 [int]$SleepDuration = 3,
-[string]$PSModulePath
+[string]$PSModulePath,
+[string]$BackupExistsAction = "Error" #Error,Skip,Continue
 )
 
 $ErrorActionPreference = "Stop"
@@ -28,17 +26,18 @@ Write-Verbose "Username = $Username"
 Write-Verbose "InstanceName = $InstanceName"
 Write-Verbose "BackupLabel = $BackupLabel"
 Write-Verbose "BackupNotes = $BackupNotes"
-Write-Verbose "IsAzureBackup = $IsAzureBackup"
-Write-Verbose "ContainerName = $ContainerName"
-Write-Verbose "StorageAccountKey = $StorageAccountKey"
-Write-Verbose "StorageAccountName = $StorageAccountName"
+Write-Verbose "MaxCrmConnectionTimeOutMinutes = $MaxCrmConnectionTimeOutMinutes"
 Write-Verbose "WaitForCompletion = $WaitForCompletion"
 Write-Verbose "SleepDuration = $SleepDuration"
 Write-Verbose "PSModulePath = $PSModulePath"
+Write-Verbose "BackupExistsAction = $BackupExistsAction"
 
 #Script Location
 $scriptPath = split-path -parent $MyInvocation.MyCommand.Definition
 Write-Verbose "Script Path: $scriptPath"
+
+#Set Security Protocol
+& "$scriptPath\SetTlsVersion.ps1"
 
 #Load Online Management Module
 $xrmOnlineModule = $scriptPath + "\Microsoft.Xrm.OnlineManagementAPI.dll"
@@ -67,15 +66,49 @@ if ($instance -eq $null)
 
 Write-Host "Backing up instance $InstanceName " + $instance.Id
 
-$backupInfo = New-CrmBackupInfo -InstanceId $instance.Id -Label "$BackupLabel" -Notes "$BackupNotes" -IsAzureBackup $IsAzureBackup -AzureContainerName $ContainerName -AzureStorageAccountKey $StorageAccountKey -AzureStorageAccountName $StorageAccountName
+$backup = Get-XrmBackupByLabel -ApiUrl $ApiUrl -Cred $Cred -InstanceId $instance.Id -Label "$BackupLabel"
+
+if ($backup)
+{
+	Write-Host "Existing Backup with same label found. Timestamp: $($backup.TimestampUtc)"
+	
+	if ($BackupExistsAction -eq "Error")
+	{
+		throw "Backup with label $BackupLabel already exists for instance"
+	}
+	elseif ($BackupExistsAction -eq "Skip")
+	{
+		Write-Warning "Skipping backup as backup with same label already exists"
+		return
+	}
+	elseif ($BackupExistsAction -eq "Continue")
+	{
+		Write-Host "Will continue to attempt another backup using same label"
+	}
+}
+else
+{
+	Write-Host "No existing backups found with label: $BackupLabel"
+}
+
+#$backupInfo = New-CrmBackupInfo -InstanceId $instance.Id -Label "$BackupLabel" -Notes "$BackupNotes" -IsAzureBackup $IsAzureBackup -AzureContainerName $ContainerName -AzureStorageAccountKey $StorageAccountKey -AzureStorageAccountName $StorageAccountName
  
-$operation = Backup-CrmInstance -ApiUrl $ApiUrl -BackupInfo $backupInfo -Credential $Cred
+$CallParams = @{
+	ApiUrl = $ApiUrl
+	Credential = $Cred
+	InstanceId = $instance.Id
+	Label = "$BackupLabel"
+    Notes = "$BackupNotes"
+}
 
-$OperationId = $operation.OperationId
-$OperationStatus = $operation.Status
+if ($MaxCrmConnectionTimeOutMinutes -and ($MaxCrmConnectionTimeOutMinutes -ne 0))
+{
+	$CallParams.MaxCrmConnectionTimeOutMinutes = $MaxCrmConnectionTimeOutMinutes
+}
 
-Write-Output "OperationId = $OperationId"
-Write-Verbose "Status = $OperationStatus"
+$operation = Backup-CrmInstance @CallParams
+
+$operation
 
 if ($operation.Errors.Count -gt 0)
 {
@@ -83,7 +116,7 @@ if ($operation.Errors.Count -gt 0)
     throw "Errors encountered : $errorMessage"
 }
 
-if ($WaitForCompletion)
+if ($WaitForCompletion -and ($operation.OperationId -ne [system.guid]::empty) -and ($OperationStatus -ne "Succeeded") -and ($OperationStatus -ne "Created"))
 {
 	$status = Wait-XrmOperation -ApiUrl $ApiUrl -Cred $Cred -operationId $operation.OperationId
 
@@ -93,6 +126,10 @@ if ($WaitForCompletion)
 	{
 		throw "Operation status: $status.Status"
 	}
+
+	Wait-XrmBackup -ApiUrl $ApiUrl -Cred $Cred -InstanceId $instance.Id -Label "$BackupLabel" -SleepDuration 15
+
+	Write-Host "Backup Completed"
 }
 
 Write-Verbose 'Leaving BackupCRMOnlineInstance.ps1'
